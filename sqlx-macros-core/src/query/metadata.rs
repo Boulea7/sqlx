@@ -187,11 +187,12 @@ fn read_dotenv(
     from_dotenv: &mut MacrosEnv,
 ) -> crate::Result<()> {
     let ignore_io_error = has_query_source_without_dotenv(from_env, from_dotenv);
+    let mut read_any_pair = false;
 
     for res in dotenv {
         let (name, val) = match res {
             Ok(pair) => pair,
-            Err(dotenvy::Error::Io(_)) if ignore_io_error => {
+            Err(dotenvy::Error::Io(_)) if ignore_io_error && !read_any_pair => {
                 break;
             }
             Err(error) => {
@@ -202,6 +203,7 @@ fn read_dotenv(
                 .into());
             }
         };
+        read_any_pair = true;
 
         match &*name {
             "SQLX_OFFLINE_DIR" => from_dotenv.offline_dir = Some(val.into()),
@@ -322,6 +324,102 @@ mod tests {
             Some("postgres://from-environment")
         );
         assert_eq!(env.offline, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permission_denied_parent_dotenv_uses_existing_query_sources() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let workspace = TestDir::new();
+        let manifest_dir = workspace.path().join("crate");
+        fs::create_dir(&manifest_dir).unwrap();
+        let parent_dotenv = workspace.path().join(".env");
+        fs::write(&parent_dotenv, "DATABASE_URL=sqlite://parent.db\n").unwrap();
+        let original_permissions = fs::metadata(&parent_dotenv).unwrap().permissions();
+        let mut restricted = original_permissions.clone();
+        restricted.set_mode(0o000);
+        fs::set_permissions(&parent_dotenv, restricted).unwrap();
+
+        match fs::File::open(&parent_dotenv) {
+            Ok(_) => {
+                fs::set_permissions(&parent_dotenv, original_permissions).unwrap();
+                eprintln!("skipping permission check: this process can read mode 000 files");
+                return;
+            }
+            Err(error) => assert_eq!(error.kind(), io::ErrorKind::PermissionDenied),
+        }
+
+        let from_process = load_test_env(
+            &manifest_dir,
+            workspace.path(),
+            MacrosEnv {
+                database_url: Some("sqlite://process.db".into()),
+                ..empty_env()
+            },
+        )
+        .unwrap();
+        fs::write(
+            manifest_dir.join(".env"),
+            "DATABASE_URL=sqlite://local.db\n",
+        )
+        .unwrap();
+        let from_local = load_test_env(&manifest_dir, workspace.path(), empty_env()).unwrap();
+        fs::set_permissions(&parent_dotenv, original_permissions).unwrap();
+
+        assert_eq!(
+            from_process.database_url.as_deref(),
+            Some("sqlite://process.db")
+        );
+        assert_eq!(
+            from_local.database_url.as_deref(),
+            Some("sqlite://local.db")
+        );
+    }
+
+    #[test]
+    fn ignored_dotenv_path_is_watched_for_later_changes() {
+        let workspace = TestDir::new();
+        let manifest_dir = workspace.path().join("crate");
+        fs::create_dir(&manifest_dir).unwrap();
+        let parent_dotenv = workspace.path().join(".env");
+        fs::create_dir(&parent_dotenv).unwrap();
+
+        let cache = MtimeCache::new();
+        let load = || {
+            cache.get_or_try_init(|builder| {
+                load_env_from_sources(
+                    &manifest_dir,
+                    workspace.path(),
+                    &Config::default(),
+                    builder,
+                    MacrosEnv {
+                        database_url: Some("sqlite://process.db".into()),
+                        ..empty_env()
+                    },
+                )
+            })
+        };
+
+        let initial = load().unwrap();
+        let cached = load().unwrap();
+        assert!(Arc::ptr_eq(&initial, &cached));
+        assert_eq!(initial.offline, None);
+
+        fs::remove_dir(&parent_dotenv).unwrap();
+        fs::write(&parent_dotenv, "SQLX_OFFLINE=true\n").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&parent_dotenv)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(
+                std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000),
+            ))
+            .unwrap();
+
+        let reloaded = load().unwrap();
+        assert!(!Arc::ptr_eq(&initial, &reloaded));
+        assert_eq!(reloaded.offline, Some(true));
     }
 
     #[test]
@@ -485,5 +583,30 @@ mod tests {
             &mut from_dotenv,
         )
         .expect("a later dotenv I/O error should not hide an existing query source");
+    }
+
+    #[test]
+    fn partially_read_dotenv_reports_io_error_with_existing_query_source() {
+        let from_env = empty_env();
+        let lines: [&'static [u8]; 2] =
+            [b"DATABASE_URL=sqlite://partial.db\n", b"UNRELATED=valid\n"];
+
+        for line in lines {
+            let mut from_dotenv = MacrosEnv {
+                database_url: Some("sqlite://known.db".into()),
+                ..empty_env()
+            };
+
+            let error = read_dotenv(
+                Path::new(".env"),
+                dotenvy::from_read_iter(ReadThenError(Some(line))),
+                &Config::default(),
+                &from_env,
+                &mut from_dotenv,
+            )
+            .expect_err("a partially read dotenv should not be silently skipped");
+
+            assert!(error.to_string().contains("error reading dotenv file"));
+        }
     }
 }
