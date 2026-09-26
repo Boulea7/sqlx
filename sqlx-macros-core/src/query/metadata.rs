@@ -224,7 +224,7 @@ fn has_query_source_without_dotenv(from_env: &MacrosEnv, from_dotenv: &MacrosEnv
     offline == Some(true) || database_url.is_some_and(|url| !url.is_empty())
 }
 
-/// Returns `true` if `val` is `"true"`,
+/// Returns `true` if `val` is `"true"` (case-insensitive) or `"1"`.
 fn is_truthy_bool(val: &str) -> bool {
     val.eq_ignore_ascii_case("true") || val == "1"
 }
